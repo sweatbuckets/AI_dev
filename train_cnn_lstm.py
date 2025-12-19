@@ -1,6 +1,8 @@
 # Filename: train_cnn_lstm.py
 
+import logging
 import os
+from matplotlib import pyplot as plt
 import pandas as pd
 import numpy as np
 import torch
@@ -9,11 +11,13 @@ from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 
+
+
 # ----------------------------
 # 1️⃣ 하이퍼파라미터
 # ----------------------------
-SEQ_LEN = 10  # 시퀀스 길이 (CSV 시퀀스 길이와 맞춰주세요)
-FEATURE_DIM = 8  # CSV feature 개수
+SEQ_LEN = 10  # 시퀀스 길이 (CSV 시퀀스 길이)
+FEATURE_DIM = 80  # sequence 하나당 feature 개수
 BATCH_SIZE = 32
 EPOCHS = 20
 LEARNING_RATE = 1e-3
@@ -76,21 +80,25 @@ print("CSV shape:", df.shape)
 # 라벨 분리
 y = df['label'].values
 X = df.drop(columns=['label']).values
+print("X shape after drop label:", X.shape)
+
+# 특징 개수 80개 더블체크 후 출력
+FEATURE_DIM = X.shape[1]
+print("Detected FEATURE_DIM:", FEATURE_DIM)
 
 # 시퀀스로 reshape: (num_samples, seq_len, feature_dim)
-num_features = FEATURE_DIM
 num_samples = len(X) // SEQ_LEN
-X = X[:num_samples*SEQ_LEN].reshape(num_samples, SEQ_LEN, num_features)
+X = X[:num_samples*SEQ_LEN].reshape(num_samples, SEQ_LEN, FEATURE_DIM)
 y = y[:num_samples*SEQ_LEN:SEQ_LEN]  # 각 시퀀스 마지막 라벨만
 
-# 표준화
-scaler = StandardScaler()
-X = X.reshape(-1, num_features)
-X = scaler.fit_transform(X)
-X = X.reshape(num_samples, SEQ_LEN, num_features)
+# 표준화 - feature 값이 전부 상대값이라 필요없을듯
+#scaler = StandardScaler()
+#X = X.reshape(-1, FEATURE_DIM)
+#X = scaler.fit_transform(X)
+#X = X.reshape(num_samples, SEQ_LEN, FEATURE_DIM)
 
 # train/test split
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42) #stratify=y 는 클래스 비율이 불균형해서 제외
 
 train_dataset = SequenceDataset(X_train, y_train)
 test_dataset = SequenceDataset(X_test, y_test)
@@ -105,9 +113,12 @@ model = CNNLSTM(FEATURE_DIM, SEQ_LEN).to(DEVICE)
 criterion = nn.CrossEntropyLoss()
 optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
+train_losses = []
+val_losses = []
+
 for epoch in range(EPOCHS):
     model.train()
-    total_loss = 0
+    total_train_loss = 0
     for X_batch, y_batch in train_loader:
         X_batch = X_batch.to(DEVICE)
         y_batch = y_batch.to(DEVICE)
@@ -118,12 +129,14 @@ for epoch in range(EPOCHS):
         loss.backward()
         optimizer.step()
         
-        total_loss += loss.item() * X_batch.size(0)
+        total_train_loss += loss.item() * X_batch.size(0)
     
-    avg_loss = total_loss / len(train_loader.dataset)
-    
+    avg_train_loss = total_train_loss / len(train_loader.dataset)
+    train_losses.append(avg_train_loss)
+
     # 평가
     model.eval()
+    total_val_loss = 0
     correct = 0
     total = 0
     with torch.no_grad():
@@ -131,12 +144,28 @@ for epoch in range(EPOCHS):
             X_batch = X_batch.to(DEVICE)
             y_batch = y_batch.to(DEVICE)
             outputs = model(X_batch)
+            loss = criterion(outputs, y_batch)
+            total_val_loss += loss.item() * X_batch.size(0)
             _, predicted = torch.max(outputs, 1)
             total += y_batch.size(0)
             correct += (predicted == y_batch).sum().item()
+    avg_val_loss = total_val_loss / len(test_loader.dataset)
+    val_losses.append(avg_val_loss)
     acc = correct / total
-    print(f"Epoch {epoch+1}/{EPOCHS} | Loss: {avg_loss:.4f} | Test Acc: {acc:.4f}")
+    
+    print(f"Epoch {epoch+1}/{EPOCHS} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | Test Acc: {acc:.4f}")
 
+
+plt.figure(figsize=(8,5))
+plt.plot(range(1, EPOCHS+1), train_losses, label='Train Loss')
+plt.plot(range(1, EPOCHS+1), val_losses, label='Validation Loss')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.title('Train vs Validation Loss')
+plt.legend()
+plt.grid(True)
+plt.savefig("loss_plot.png")  # 파일로 저장
+plt.show()
 # ----------------------------
 # 6️⃣ 모델 저장
 # ----------------------------
