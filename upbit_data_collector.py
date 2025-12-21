@@ -4,23 +4,16 @@ import requests
 import websocket
 import json
 import threading
-from collections import deque
 import time
 
-# -------------------------
-# 1️⃣ 설정
-# -------------------------
-CHECK_INTERVAL = 30      # 거래량 체크 간격 (초)
-VOLUME_THRESHOLD = 1.2   # 최근 대비 거래량 몇 배 증가 시 급증으로 판단
-TOP_N = 10               # 상위 N개 급증 코인 선택
-VOLUME_WINDOW = 6        # 비교를 위한 이동 윈도우(샘플 수)
+
+# 설정
+CHECK_INTERVAL = 30      # 시장 체크 간격 (초)
+TOP_N = 5               # 상위 N개 급증 코인 선택
 SPAWN_WS = {}            # WebSocket 스레드 저장
+tick_data = {}          # 틱 데이터 저장용
 
-tick_data = {}
-
-# -------------------------
-# 2️⃣ REST API로 거래량 조회
-# -------------------------
+# REST API로 시장 데이터 조회
 def get_markets():
     url = "https://api.upbit.com/v1/market/all"
     try:
@@ -45,9 +38,7 @@ def get_tickers(markets):
         print(f"get_tickers error: {e}")
         return []
 
-# -------------------------
 # 3️⃣ WebSocket 구독
-# -------------------------
 def ws_on_message(ws, message):
     data = json.loads(message)
     symbol = data["code"]
@@ -73,7 +64,7 @@ def start_ws(symbols):
     ws.send(json.dumps(payload))
     return ws
 
-# 가격 급상승 10개 종목 가져오기
+# 가격 급상승 N개 종목 가져오기
 prev_prices = {}  # 직전 종가 저장용
 
 def detect_price_spike():
@@ -94,7 +85,7 @@ def detect_price_spike():
 
         spike_symbols.append((symbol, price_change))
 
-    # 상위 10개 상승 종목 선택
+    # 상위 N개 상승 종목 선택
     spike_symbols = sorted(spike_symbols, key=lambda x: x[1], reverse=True)[:TOP_N]
     top_symbols = [s[0] for s in spike_symbols]
 
@@ -105,9 +96,7 @@ def detect_price_spike():
         SPAWN_WS.update({s: True for s in new_symbols})
         start_ws(new_symbols)
 
-# -------------------------
-# 5️⃣ 메인 루프
-# -------------------------
+# 메인 루프
 if __name__ == "__main__":
     print(f"Starting Upbit price spike collector. interval={CHECK_INTERVAL}s top_n={TOP_N}")
     try:
