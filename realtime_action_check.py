@@ -1,190 +1,230 @@
 # Filename: realtime_action_check.py
 
-import os
 import time
 import json
 import logging
+import threading
+from collections import deque
+
+import requests
 import pandas as pd
 import torch
 import torch.nn as nn
-from collections import deque
 import websocket
+from sklearn.metrics import accuracy_score, f1_score
 
-# -------------------------
-# 1️⃣ 설정
-# -------------------------
-MODEL_PATH = "models/lstm_train.pt"
-SEQ_LEN = 20
+# =========================
+# 1️⃣ 기본 설정
+# =========================
+MODEL_PATH = "models/cnn_lstm_model.pth"
+
+INTERVAL_SEC = 30
+SEQ_LEN = 10                 
+LABEL_THRESHOLD = 0.008
+
 FEATURE_COLS = [
-    'last_return','mean_return','std_return','slope','accel','price_dev',
-    'volume_ratio','activity_score','cusum_pos','cusum_neg','cusum_last'
+    'open','high','low','close',
+    'volume','tick_count',
+    'bid_volume','ask_volume'
 ]
+
 ACTION_MAP = {'hold':0,'buy':1,'sell':2}
 INV_ACTION_MAP = {v:k for k,v in ACTION_MAP.items()}
-INTERVAL_SEC = 10
-HISTORY_WINDOW = 200
-MARKETS = ["KRW-BTC"]  # 예시
 
-# -------------------------
-# 2️⃣ 모델 정의
-# -------------------------
-class LSTMClassifier(nn.Module):
-    def __init__(self, num_features, hidden_size=64, num_layers=2, num_classes=3):
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s: %(message)s"
+)
+
+# =========================
+# 2️⃣ 상승률 가장 높은 코인 선택
+# =========================
+def select_top_symbol():
+    url = "https://api.upbit.com/v1/ticker"
+    markets = requests.get("https://api.upbit.com/v1/market/all").json()
+    krw_markets = [m['market'] for m in markets if m['market'].startswith("KRW-")]
+
+    res = requests.get(url, params={"markets": ",".join(krw_markets)}).json()
+    df = pd.DataFrame(res)
+    df['change_rate'] = df['signed_change_rate'].abs()
+
+    top = df.sort_values("change_rate", ascending=False).iloc[0]['market']
+    return top
+
+# =========================
+# 3️⃣ CNN-LSTM 모델
+# =========================
+class CNNLSTM(nn.Module):
+    def __init__(self, per_step_feature, num_classes=3):
         super().__init__()
-        self.lstm = nn.LSTM(num_features, hidden_size, num_layers, batch_first=True)
-        self.dropout = nn.Dropout(0.2)
-        self.fc = nn.Linear(hidden_size, num_classes)
+        self.conv1 = nn.Conv1d(per_step_feature, 32, kernel_size=3, padding=1)
+        self.relu = nn.ReLU()
+        self.pool = nn.MaxPool1d(2)
+        self.lstm = nn.LSTM(32, 64, batch_first=True)
+        self.fc = nn.Linear(64, num_classes)
 
     def forward(self, x):
-        out, _ = self.lstm(x)
-        out = out[:, -1, :]
-        out = self.dropout(out)
-        out = self.fc(out)
-        return out
+        x = x.permute(0, 2, 1)
+        x = self.pool(self.relu(self.conv1(x)))
+        x = x.permute(0, 2, 1)
+        x, _ = self.lstm(x)
+        return self.fc(x[:, -1])
 
-# -------------------------
-# 3️⃣ 모델 로드
-# -------------------------
-device = torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")
-model = LSTMClassifier(num_features=len(FEATURE_COLS))
-model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
-model.to(device)
-model.eval()
-logging.info("Loaded model on device: %s", device)
-
-# -------------------------
-# 4️⃣ WebSocket 수집
-# -------------------------
-histories = {m: deque(maxlen=HISTORY_WINDOW) for m in MARKETS}
-last_interval = {m: None for m in MARKETS}
-
-def aggregate_ticks(ticks):
-    if not ticks:
-        return None
-    df = pd.DataFrame(ticks)
-    if df.empty: return None
-
-    if 'timestamp' in df.columns:
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-    else:
-        df['timestamp'] = pd.to_datetime(pd.Series([int(time.time()*1000)]*len(df)), unit='ms')
-
-    df['interval'] = df['timestamp'].dt.floor(f'{INTERVAL_SEC}s')
-    agg = df.groupby('interval').agg(
-        open=('trade_price','first'),
-        high=('trade_price','max'),
-        low=('trade_price','min'),
-        close=('trade_price','last'),
-        volume=('trade_volume','sum'),
-        tick_count=('trade_price','count')
-    ).reset_index()
-
-    if len(agg) < 2:
-        return None
-
-    agg['last_return'] = agg['close'].pct_change().fillna(0)
-    agg['mean_return'] = agg['last_return'].rolling(3, min_periods=1).mean()
-    agg['std_return'] = agg['last_return'].rolling(3, min_periods=1).std().fillna(0)
-    agg['slope'] = agg['close'].diff().fillna(0)
-    agg['accel'] = agg['slope'].diff().fillna(0)
-    agg['price_dev'] = agg['close'] - agg['close'].rolling(3, min_periods=1).mean()
-    rolling_vol_mean = agg['volume'].rolling(3, min_periods=1).mean().replace(0, pd.NA)
-    agg['volume_ratio'] = agg['volume'] / rolling_vol_mean
-    agg['activity_score'] = agg['tick_count'] * agg['volume_ratio']
-    agg['cusum_pos'] = agg['last_return'].apply(lambda x: max(x,0)).cumsum()
-    agg['cusum_neg'] = agg['last_return'].apply(lambda x: min(x,0)).cumsum()
-    agg['cusum_last'] = agg['last_return'].rolling(3, min_periods=1).sum()
-
-    # action label 계산
-    agg['action'] = 'hold'
-    closes = agg['close'].values
-    for i in range(len(closes)-1):
-        change = (closes[i+1]-closes[i])/closes[i]
-        if change >= 0.03:
-            agg.loc[i,'action'] = 'buy'
-        elif change <= -0.03:
-            agg.loc[i,'action'] = 'sell'
-
-    return agg
-
+# =========================
+# 4️⃣ WebSocket Collector
+# =========================
 class WSTickCollector:
-    def __init__(self, markets):
-        self.markets = markets
-        self.ticks = {m: deque() for m in markets}
-        self.lock = False
-        self.ws = None
+    def __init__(self, market, maxlen=5000):
+        self.market = market
+        self.ticks = deque(maxlen=maxlen)
+        self.orderbooks = deque(maxlen=maxlen)
+        self.lock = threading.Lock()
 
     def on_message(self, ws, message):
         data = json.loads(message)
-        market = data.get('code') or data.get('market')
-        if not market or market not in self.markets:
-            return
-        self.ticks[market].append(data)
+        with self.lock:
+            if 'trade_price' in data:
+                self.ticks.append({
+                    'trade_price': data['trade_price'],
+                    'trade_volume': data['trade_volume'],
+                    'timestamp': data['timestamp']
+                })
+            elif 'orderbook_units' in data:
+                ts = data['timestamp']
+                for u in data['orderbook_units']:
+                    self.orderbooks.append({
+                        'timestamp': ts,
+                        'bid_size': u['bid_size'],
+                        'ask_size': u['ask_size'],
+                        'bid_price': u['bid_price'],
+                        'ask_price': u['ask_price']
+                    })
 
     def on_open(self, ws):
-        payload = [{"ticket":"realtime"},{"type":"trade","codes":self.markets,"isOnlyRealtime":True}]
+        payload = [
+            {"ticket":"ml"},
+            {"type":"trade","codes":[self.market],"isOnlyRealtime":True},
+            {"type":"orderbook","codes":[self.market]}
+        ]
         ws.send(json.dumps(payload))
-        logging.info("Subscribed WebSocket for %d symbols", len(self.markets))
+        logging.info("WebSocket subscribed for %s", self.market)
 
     def start(self):
-        def run_ws():
-            self.ws = websocket.WebSocketApp(
+        def run():
+            ws = websocket.WebSocketApp(
                 "wss://api.upbit.com/websocket/v1",
                 on_message=self.on_message,
                 on_open=self.on_open
             )
-            self.ws.run_forever()
-        import threading
-        t = threading.Thread(target=run_ws, daemon=True)
-        t.start()
+            ws.run_forever()
+
+        threading.Thread(target=run, daemon=True).start()
         time.sleep(1)
 
     def pop_all(self):
-        out = {m:list(self.ticks[m]) for m in self.markets}
-        for m in self.markets:
-            self.ticks[m].clear()
-        return out
+        with self.lock:
+            t = list(self.ticks)
+            o = list(self.orderbooks)
+            self.ticks.clear()
+            self.orderbooks.clear()
+        return t, o
 
-# -------------------------
-# 5️⃣ 실시간 예측 + 맞았는지 확인
-# -------------------------
-collector = WSTickCollector(MARKETS)
-collector.start()
-logging.info("Realtime collector started")
+# =========================
+# 5️⃣ 인터벌 집계
+# =========================
+def aggregate_interval(ticks, orderbooks):
+    if not ticks:
+        return None
 
-try:
+    df = pd.DataFrame(ticks)
+    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
+    df.set_index('timestamp', inplace=True)
+
+    ohlc = df['trade_price'].resample(f'{INTERVAL_SEC}s').ohlc()
+    ohlc['volume'] = df['trade_volume'].resample(f'{INTERVAL_SEC}s').sum()
+    ohlc['tick_count'] = df['trade_price'].resample(f'{INTERVAL_SEC}s').count()
+
+    if orderbooks:
+        ob = pd.DataFrame(orderbooks)
+        ob['timestamp'] = pd.to_datetime(ob['timestamp'], unit='ms', utc=True)
+        ob.set_index('timestamp', inplace=True)
+        ob = ob.resample(f'{INTERVAL_SEC}s').agg({
+            'bid_size':'sum','ask_size':'sum'
+        })
+        ohlc = ohlc.join(ob, how='left')
+    else:
+        ohlc['bid_size'] = ohlc['ask_size'] = 0
+
+    ohlc.rename(columns={'bid_size':'bid_volume','ask_size':'ask_volume'}, inplace=True)
+    ohlc.reset_index(inplace=True)
+
+    closes = ohlc['close'].values
+    actions = ['hold'] * len(closes)
+    for i in range(len(closes)-1):
+        r = (closes[i+1] - closes[i]) / closes[i]
+        if r >= LABEL_THRESHOLD:
+            actions[i] = 'buy'
+        elif r <= -LABEL_THRESHOLD:
+            actions[i] = 'sell'
+    ohlc['action'] = actions
+
+    return ohlc
+
+# =========================
+# 6️⃣ 메인 루프
+# =========================
+if __name__ == "__main__":
+    market = select_top_symbol()
+    logging.info("Selected top symbol: %s", market)
+
+    device = torch.device("mps") if torch.backends.mps.is_available() else "cpu"
+    model = CNNLSTM(len(FEATURE_COLS))
+    model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
+    model.to(device).eval()
+    logging.info("CNN-LSTM model loaded on device: %s", device)
+
+    collector = WSTickCollector(market)
+    collector.start()
+    logging.info("WebSocket collector started for %s", market)
+
+    history = deque(maxlen=SEQ_LEN)
+    last_interval = None
+
+    y_true, y_pred = [], []
+
     while True:
         time.sleep(INTERVAL_SEC)
-        ticks_data = collector.pop_all()
+        ticks, obs = collector.pop_all()
+        agg = aggregate_interval(ticks, obs)
+        if agg is None or len(agg) < 2:
+            continue
 
-        for market in MARKETS:
-            ticks = ticks_data.get(market, [])
-            agg = aggregate_ticks(ticks)
-            if agg is None or agg.empty:
-                continue
+        row = agg.iloc[-2]   # 마지막은 아직 라벨 없으므로 그 전의 인터벌로 비교
+        interval = row['timestamp']
 
-            for idx, row in agg.iterrows():
-                interval = row['interval']
-                if last_interval[market] is not None and interval <= last_interval[market]:
-                    continue
+        if last_interval is not None and interval <= last_interval:
+            continue
+        last_interval = interval
 
-                histories[market].append(row)
-                last_interval[market] = interval
+        fv = [row[c] for c in FEATURE_COLS]
+        history.append(fv)
 
-                if len(histories[market]) >= SEQ_LEN + 1:
-                    # 시퀀스 준비
-                    seq = list(histories[market])[-(SEQ_LEN+1):-1]
-                    X_input = torch.tensor([[ [r[col] for col in FEATURE_COLS] for r in seq ]], dtype=torch.float32).to(device)
-                    y_true = ACTION_MAP[row['action']]
+        if len(history) < SEQ_LEN:
+            logging.info("[%s] Warming up (%d/%d)", interval, len(history), SEQ_LEN)
+            continue
 
-                    # 예측
-                    with torch.no_grad():
-                        output = model(X_input)
-                        pred = output.argmax(dim=1).item()
+        X = torch.tensor([list(history)], dtype=torch.float32).to(device)
+        with torch.no_grad():
+            pred = model(X).argmax(1).item()
 
-                    # 결과 출력
-                    match = "✅" if pred == y_true else "❌"
-                    print(f"[{interval}] Market: {market} | Pred: {INV_ACTION_MAP[pred]} | True: {row['action']} {match}")
+        true = ACTION_MAP[row['action']]
+        y_true.append(true)
+        y_pred.append(pred)
 
-except KeyboardInterrupt:
-    print("Stopped by user")
+        acc = accuracy_score(y_true, y_pred)
+        f1 = f1_score(y_true, y_pred, average='macro')
+
+        logging.info(
+            "[%s] Pred=%s True=%s | Acc=%.3f F1=%.3f",
+            interval, INV_ACTION_MAP[pred], row['action'], acc, f1
+        )

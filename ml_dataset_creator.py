@@ -32,52 +32,47 @@ FEATURE_COLS = [
 
 # 2. Upbit 틱 데이터 가져오기
 class WSTickCollector:
-    def __init__(self, markets):
+    def __init__(self, markets, maxlen=5000):
         self.markets = list(markets)
-        self.ticks = {m: deque() for m in self.markets}
-        self.orderbooks = {m: deque() for m in self.markets}
+        self.ticks = {m: deque(maxlen=maxlen) for m in self.markets}
+        self.orderbooks = {m: deque(maxlen=maxlen) for m in self.markets}
         self.lock = threading.Lock()
         self.ws = None
 
     def on_message(self, ws, message):
         try:
             data = json.loads(message)
-            market = data.get('code')
-            if not market:
+            market = data.get('code') or data.get('market')
+            if not market or market not in self.markets:
                 return
-        
 
-            # -----------------
-            # TRADE
-            # -----------------
+            # 거래 데이터
             if 'trade_price' in data:
                 tick = {
                     'market': market,
-                    'trade_price': data.get('trade_price'),
-                    'trade_volume': data.get('trade_volume'),
+                    'trade_price': float(data.get('trade_price', 0)),
+                    'trade_volume': float(data.get('trade_volume', 0)),
                     'timestamp': data.get('timestamp'),
                     'ask_bid': data.get('ask_bid'),
                 }
                 with self.lock:
                     self.ticks[market].append(tick)
 
-
-            # -----------------
-            # ORDERBOOK
-            # -----------------
+            # orderbook 데이터
             elif 'orderbook_units' in data:
                 ts = data.get('timestamp')
+                ob_batch = []
+                for u in data['orderbook_units']:
+                    ob_batch.append({
+                        'market': market,
+                        'timestamp': ts,
+                        'bid_price': float(u['bid_price']),
+                        'bid_size': float(u['bid_size']),
+                        'ask_price': float(u['ask_price']),
+                        'ask_size': float(u['ask_size']),
+                    })
                 with self.lock:
-                    for u in data['orderbook_units']:
-                        self.orderbooks[market].append({
-                            'market': market,
-                            'timestamp': ts,
-                            'bid_price': u['bid_price'],
-                            'bid_size': u['bid_size'],
-                            'ask_price': u['ask_price'],
-                            'ask_size': u['ask_size'],
-                        })
-
+                    self.orderbooks[market].extend(ob_batch)
 
         except Exception as e:
             logging.debug("WS message parse error: %s", e)
@@ -85,13 +80,12 @@ class WSTickCollector:
     def on_open(self, ws):
         payload = [
             {"ticket": "ml_dataset_collector"},
-            {"type": "trade", 
+            {"type": "trade",
              "codes": self.markets,
              "isOnlyRealtime": True
             },
-            {
-            "type": "orderbook",
-            "codes": self.markets
+            {"type": "orderbook",
+             "codes": self.markets
             }
         ]
         ws.send(json.dumps(payload))
@@ -99,6 +93,7 @@ class WSTickCollector:
 
     def start(self):
         def run_ws():
+            import websocket
             self.ws = websocket.WebSocketApp(
                 "wss://api.upbit.com/websocket/v1",
                 on_message=self.on_message,
@@ -108,18 +103,18 @@ class WSTickCollector:
 
         t = threading.Thread(target=run_ws, daemon=True)
         t.start()
+        import time
         time.sleep(1)
 
+    # deque 비우기 전에 Lock 걸고 모든 메시지 추출
     def pop_all(self):
         with self.lock:
-            trade_items = {m: list(self.ticks[m]) for m in self.markets}
-            orderbook_items = {m: list(self.orderbooks[m]) for m in self.markets}
-
+            out_ticks = {m: list(self.ticks[m]) for m in self.markets}
+            out_orderbooks = {m: list(self.orderbooks[m]) for m in self.markets}
             for m in self.markets:
                 self.ticks[m].clear()
                 self.orderbooks[m].clear()
-
-        return trade_items, orderbook_items
+        return out_ticks, out_orderbooks
 
 
 
@@ -363,14 +358,14 @@ def create_sequences_one_market(
         # 시퀀스 끝에서 다음 label_len 구간의 수익률로 라벨 계산
         future_return = np.prod(1 + returns[i+seq_len:i+seq_len+label_len]) - 1
 
-        if future_return >= threshold:
+        if future_return >= threshold: # threshold 이상으로 상승 = 매수판단 했어야 함
             Y.append(2)
-        elif future_return <= -threshold:
+        elif future_return <= -threshold: # threshold 이상으로 하락 = 매도판단 했어야 함
             Y.append(0)
         else:
-            Y.append(1)
+            Y.append(1)                 # 그 외 : 관망
 
-        # 수정: 시퀀스 시작 interval 기준으로 seq_ids 저장
+        # 시퀀스 시작 interval 기준으로 seq_ids 저장
         seq_ids.append(df_feat['interval'].iloc[i])  
 
     return np.array(X), np.array(Y), seq_ids
