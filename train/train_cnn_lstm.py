@@ -12,6 +12,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import f1_score, confusion_matrix
 import seaborn as sns
+import joblib
 
 # 하이퍼파라미터
 SEQ_LEN = 10  # 시퀀스 길이 (CSV 시퀀스 길이)
@@ -84,6 +85,11 @@ print("Label distribution:", np.bincount(y)) # 클래스 분포 확인
 scaler = StandardScaler()
 X_2d = X.reshape(-1, PER_STEP_FEATURE)  # (num_samples * SEQ_LEN, PER_STEP_FEATURE)
 X_2d = scaler.fit_transform(X_2d)
+
+# scaler 저장
+os.makedirs("models", exist_ok=True)
+joblib.dump(scaler, "models/feature_scaler.pkl")
+print("Scaler saved to models/feature_scaler.pkl")
 
 # 다시 3D로 reshape
 X = X_2d.reshape(num_samples, SEQ_LEN, PER_STEP_FEATURE)
