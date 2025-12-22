@@ -1,4 +1,4 @@
-# Filename: realtime_action_check.py
+# Filename: realtime_action_infer.py
 
 import time
 import json
@@ -12,7 +12,6 @@ import torch
 import torch.nn as nn
 import websocket
 import joblib
-from sklearn.metrics import accuracy_score, f1_score
 import numpy as np
 
 # =========================
@@ -23,7 +22,6 @@ SCALER_PATH = "models/feature_scaler.pkl"
 
 INTERVAL_SEC = 30
 SEQ_LEN = 10
-LABEL_THRESHOLD = 0.008
 
 FEATURE_COLS = [
     'slope','accel','last_return',
@@ -50,12 +48,11 @@ def select_top_symbol():
     res = requests.get(url, params={"markets": ",".join(krw_markets)}).json()
     df = pd.DataFrame(res)
     df['change_rate'] = df['signed_change_rate'].abs()
-
     top = df.sort_values("change_rate", ascending=False).iloc[0]['market']
     return top
 
 # =========================
-# 3️⃣ CNN-LSTM 모델
+# 3️⃣ CNN-LSTM 모델 정의
 # =========================
 class CNNLSTM(nn.Module):
     def __init__(self, per_step_feature, num_classes=3):
@@ -199,7 +196,7 @@ def aggregate_interval(ticks, orderbooks):
     return ohlc
 
 # =========================
-# 7️⃣ 메인 루프
+# 7️⃣ 메인 루프 (실시간 전용)
 # =========================
 if __name__ == "__main__":
     market = select_top_symbol()
@@ -219,7 +216,6 @@ if __name__ == "__main__":
     market_history = pd.DataFrame()
     history = deque(maxlen=SEQ_LEN)
     last_interval = None
-    y_true, y_pred = [], []
 
     while True:
         time.sleep(INTERVAL_SEC)
@@ -237,45 +233,22 @@ if __name__ == "__main__":
         if new_rows.empty:
             continue
 
-        for idx, row in new_rows.iterrows():
+        for _, row in new_rows.iterrows():
             fv = [row[c] for c in FEATURE_COLS]
             fv_scaled = scaler.transform([fv])[0]
             history.append(fv_scaled)
 
-            # 이전 인터벌 timestamp 업데이트
             last_interval = row['timestamp']
 
-            # SEQ_LEN 이상이면 바로 예측
             if len(history) < SEQ_LEN:
                 logging.info("[%s] Warming up (%d/%d)", row['timestamp'], len(history), SEQ_LEN)
                 continue
 
-            X = torch.from_numpy(np.array(history, dtype=np.float32))  # history (deque of ndarray) → single numpy array
-            X = X.unsqueeze(0).to(device)  # 배치 차원 추가 + device로 이동
-            
+            # ------------------------------
+            # 모델 입력 변환 및 예측
+            X = torch.from_numpy(np.array(history, dtype=np.float32)).unsqueeze(0).to(device)
             with torch.no_grad():
                 pred = model(X).argmax(1).item()
 
-            # 실제 라벨은 이전 인터벌 기준
-            prev_idx = idx - 1
-            if prev_idx < 0:
-                continue
-            prev_row = feat_df.iloc[prev_idx]
-            r = prev_row['last_return']
-            if r >= LABEL_THRESHOLD:
-                true = ACTION_MAP['buy']
-            elif r <= -LABEL_THRESHOLD:
-                true = ACTION_MAP['sell']
-            else:
-                true = ACTION_MAP['hold']
-
-            y_true.append(true)
-            y_pred.append(pred)
-
-            acc = accuracy_score(y_true, y_pred)
-            f1 = f1_score(y_true, y_pred, average='macro')
-
-            logging.info(
-                "[%s] Pred=%s True=%s | Acc=%.3f F1=%.3f",
-                row['timestamp'], INV_ACTION_MAP[pred], INV_ACTION_MAP[true], acc, f1
-            )
+            action = INV_ACTION_MAP[pred]
+            logging.info("[%s] Predicted Action: %s", row['timestamp'], action)

@@ -342,8 +342,7 @@ def create_sequences_one_market(
     ):
 
     seq_len = seq_len_sec // interval_sec
-    label_len = 30 // interval_sec
-
+    label_len = 1  # 다음 30초(1 interval) 고정
     if len(df_feat) < seq_len + label_len:
         return None, None, None
 
@@ -355,8 +354,8 @@ def create_sequences_one_market(
         seq_x = df_feat.iloc[i:i+seq_len][features].values
         X.append(seq_x)
 
-        # 시퀀스 끝에서 다음 label_len 구간의 수익률로 라벨 계산
-        future_return = np.prod(1 + returns[i+seq_len:i+seq_len+label_len]) - 1
+        # 시퀀스 종료 직후 30초 수익률
+        future_return = returns[i + seq_len]
 
         if future_return >= threshold: # threshold 이상으로 상승 = 매수판단 했어야 함
             Y.append(2)
