@@ -1,7 +1,13 @@
-# generated artifacts
-dataset/
-models/
+# local env
+.venv/
 
 # python cache
 __pycache__/
 *.py[cod]
+
+# generated artifacts
+dataset/
+models/
+
+# macOS
+.DS_Store
