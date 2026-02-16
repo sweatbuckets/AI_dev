@@ -220,6 +220,7 @@ if __name__ == "__main__":
     history = deque(maxlen=SEQ_LEN)
     last_interval = None
     y_true, y_pred = [], []
+    pending_pred = None  # (pred_timestamp, pred_class)
 
     while True:
         time.sleep(INTERVAL_SEC)
@@ -237,13 +238,41 @@ if __name__ == "__main__":
         if new_rows.empty:
             continue
 
-        for idx, row in new_rows.iterrows():
+        for _, row in new_rows.iterrows():
             fv = [row[c] for c in FEATURE_COLS]
             fv_scaled = scaler.transform([fv])[0]
             history.append(fv_scaled)
 
             # 이전 인터벌 timestamp 업데이트
             last_interval = row['timestamp']
+
+            # 한 구간 지연 평가:
+            # t에서 만든 예측은 t+1 row가 들어왔을 때 row['last_return']로 평가
+            if pending_pred is not None:
+                pred_ts, prev_pred = pending_pred
+                r = row['last_return']
+                if r >= LABEL_THRESHOLD:
+                    true = ACTION_MAP['buy']
+                elif r <= -LABEL_THRESHOLD:
+                    true = ACTION_MAP['sell']
+                else:
+                    true = ACTION_MAP['hold']
+
+                y_true.append(true)
+                y_pred.append(prev_pred)
+
+                acc = accuracy_score(y_true, y_pred)
+                f1 = f1_score(y_true, y_pred, average='macro')
+
+                logging.info(
+                    "[pred@%s eval@%s] Pred=%s True=%s | Acc=%.3f F1=%.3f",
+                    pred_ts,
+                    row['timestamp'],
+                    INV_ACTION_MAP[prev_pred],
+                    INV_ACTION_MAP[true],
+                    acc,
+                    f1
+                )
 
             # SEQ_LEN 이상이면 바로 예측
             if len(history) < SEQ_LEN:
@@ -256,26 +285,5 @@ if __name__ == "__main__":
             with torch.no_grad():
                 pred = model(X).argmax(1).item()
 
-            # 실제 라벨은 이전 인터벌 기준
-            prev_idx = idx - 1
-            if prev_idx < 0:
-                continue
-            prev_row = feat_df.iloc[prev_idx]
-            r = prev_row['last_return']
-            if r >= LABEL_THRESHOLD:
-                true = ACTION_MAP['buy']
-            elif r <= -LABEL_THRESHOLD:
-                true = ACTION_MAP['sell']
-            else:
-                true = ACTION_MAP['hold']
-
-            y_true.append(true)
-            y_pred.append(pred)
-
-            acc = accuracy_score(y_true, y_pred)
-            f1 = f1_score(y_true, y_pred, average='macro')
-
-            logging.info(
-                "[%s] Pred=%s True=%s | Acc=%.3f F1=%.3f",
-                row['timestamp'], INV_ACTION_MAP[pred], INV_ACTION_MAP[true], acc, f1
-            )
+            # 이번 예측은 다음 인터벌에서 평가
+            pending_pred = (row['timestamp'], pred)
