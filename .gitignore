@@ -1,3 +1,7 @@
 # generated artifacts
 dataset/
 models/
+
+# python cache
+__pycache__/
+*.py[cod]
