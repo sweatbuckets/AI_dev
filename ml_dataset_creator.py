@@ -643,14 +643,16 @@ if __name__ == "__main__":
             # CSV 저장 후 features_by_market에서 interval 제거
             for market, df in features_by_market.items():
                 mask = pd.Series(True, index=df.index)
-                for _, start_interval in seq_ids:
-                    if _ != market:
+                for sid_market, start_interval in seq_ids:
+                    if sid_market != market:
                         continue
-                    # 시퀀스 interval 범위 계산
-                seq_start = start_interval
-                seq_end = start_interval + pd.Timedelta(seconds=SEQ_LEN_SEC - INTERVAL_SEC)
-                mask &= ~((df['interval'] >= seq_start) & (df['interval'] <= seq_end))
-            features_by_market[market] = df[mask].reset_index(drop=True)
+
+                    # 시퀀스 interval 범위 계산 (시장별로 해당 구간 제거)
+                    seq_start = pd.to_datetime(start_interval)
+                    seq_end = seq_start + pd.Timedelta(seconds=SEQ_LEN_SEC - INTERVAL_SEC)
+                    mask &= ~((df['interval'] >= seq_start) & (df['interval'] <= seq_end))
+
+                features_by_market[market] = df[mask].reset_index(drop=True)
 
 
     except KeyboardInterrupt:
